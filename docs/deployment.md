@@ -2,13 +2,13 @@
 
 This guide covers production deployment of the three Linkora backend services:
 
-| Service                     | Default Port | Description                                            |
-| --------------------------- | ------------ | ------------------------------------------------------ |
-| `services/indexer`          | 3000         | Off-chain Soroban event indexer and REST/WebSocket API |
-| `services/dm-relay`         | 3001         | Transport-only E2EE direct-message relay               |
-| `services/analytics-oracle` | 4000         | Ed25519 analytics attestation oracle                   |
-| `services/notification`     | 3002         | Push-notification fanout and delivery service *(planned)* |
-| `services/search`           | 3003         | Full-text and semantic content search service *(planned)* |
+| Service                     | Default Port | Description                                               |
+| --------------------------- | ------------ | --------------------------------------------------------- |
+| `services/indexer`          | 3000         | Off-chain Soroban event indexer and REST/WebSocket API    |
+| `services/dm-relay`         | 3001         | Transport-only E2EE direct-message relay                  |
+| `services/analytics-oracle` | 4000         | Ed25519 analytics attestation oracle                      |
+| `services/notification`     | 3002         | Push-notification fanout and delivery service _(planned)_ |
+| `services/search`           | 3003         | Full-text and semantic content search service _(planned)_ |
 
 ---
 
@@ -18,6 +18,7 @@ This guide covers production deployment of the three Linkora backend services:
 2. [Environment Variable Reference](#2-environment-variable-reference)
    - [Shared rate limiting (`REDIS_URL`)](#24-shared-rate-limiting-redis_url)
 3. [Database Migration Steps](#3-database-migration-steps)
+   - [3a. Migration Rollback Decision Matrix](#3a-migration-rollback-decision-matrix)
 4. [Docker Compose Deployment](#4-docker-compose-deployment)
 5. [Kubernetes Deployment](#5-kubernetes-deployment)
 6. [Health Check Endpoints](#6-health-check-endpoints)
@@ -191,6 +192,93 @@ cd services/dm-relay && pnpm db:migrate
 ### Analytics Oracle
 
 The oracle reads from the indexer's database (read-only). No schema of its own needs to be created.
+
+---
+
+## 3a. Migration Rollback Decision Matrix
+
+When a migration has been applied but the release is unhealthy, operators must
+choose between three strategies. The choice depends on whether the migration is
+reversible and whether application writes have already landed against the new
+schema.
+
+### Decision matrix
+
+| Scenario                                           | Preconditions                                                                                        | Strategy                                                                                                                          | Verification query                                                                                                                                                                            |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Reversible migration, no post-migration writes** | Migration is additive (new column or index only); no application writes have used the new column yet | **Roll forward** to a fixed release, or revert with the reverse migration script                                                  | `SELECT COUNT(*) FROM <table> WHERE <new_column> IS NOT NULL;` — expect `0` if no writes landed                                                                                               |
+| **Reversible migration, writes already landed**    | New column exists; rows have been written using it before the rollback decision was made             | **Roll forward** only — do not drop the column; existing data would be destroyed                                                  | `SELECT MAX(created_at) FROM <table>;` — compare against the migration timestamp to confirm writes exist                                                                                      |
+| **Destructive or partially applied migration**     | A `DROP COLUMN` or `DROP TABLE` ran, or the migration exited mid-run leaving the schema inconsistent | **Restore from snapshot** — stop writes, restore the last pre-migration backup, replay the indexer from the last clean checkpoint | `SELECT column_name FROM information_schema.columns WHERE table_name = '<table>';` to confirm column presence; `SELECT processed_cursor FROM indexer_state;` to verify the indexer checkpoint |
+
+### Roll-forward procedure
+
+Use roll-forward when the schema is intact and no writes depend on a column
+being absent:
+
+```bash
+# 1. Deploy the fixed release image
+docker compose pull indexer dm-relay analytics-oracle
+docker compose up -d --no-deps indexer dm-relay analytics-oracle
+
+# 2. Apply the corrective migration
+psql "$DATABASE_URL" -f services/indexer/migrations/<NNN>_fix.sql
+
+# 3. Confirm the schema matches the expected snapshot
+psql "$DATABASE_URL" -c "\d+ <table>"
+```
+
+### Restore from snapshot procedure
+
+Use restore when writes have already corrupted the new schema, or when the
+migration is partially applied and the schema is inconsistent:
+
+```bash
+# 1. Stop all services to prevent further writes
+docker compose stop indexer dm-relay analytics-oracle
+
+# 2. Restore the last pre-migration snapshot
+gunzip -c indexer-<snapshot-date>.sql.gz | psql "$DATABASE_URL_INDEXER"
+
+# 3. Set START_LEDGER in .env to the ledger recorded just before the migration
+#    so the indexer re-derives on-chain state from a known clean point
+#    Example:
+#    START_LEDGER=12340000
+
+# 4. Restart services — the indexer backfills from START_LEDGER automatically
+docker compose up -d
+```
+
+> **Effect on writes made after the snapshot.** Any writes that arrived between
+> the snapshot and the restore are lost. The indexer re-derives on-chain data
+> (posts, follows, tips) by replaying Soroban events from `START_LEDGER`, but
+> off-chain data (DM relay messages, oracle attestation cache) is not recovered
+> automatically. Coordinate with users if messages in the restore window are
+> business-critical.
+
+### Checkpoint reconciliation
+
+After a restore, verify the indexer cursor has caught up and dependent services
+agree on the current state:
+
+```sql
+-- Confirm processed_cursor is advancing past the restore point
+SELECT processed_cursor FROM indexer_state;
+
+-- Confirm no ledger gap remains in the events table
+SELECT MAX(ledger_sequence) AS latest_indexed FROM events;
+```
+
+Compare `latest_indexed` against the current Stellar network ledger via the
+Soroban RPC endpoint:
+
+```bash
+curl -s "$STELLAR_RPC_URL/health" | jq '.latestLedger'
+```
+
+The difference should be within your `BACKFILL_ALERT_THRESHOLD` (default
+5 000 ledgers). If the gap is larger, increase `BACKFILL_MAX_DEPTH_LEDGERS`
+temporarily and restart the indexer, then restore it to the default once
+backfill completes.
 
 ---
 
@@ -726,10 +814,10 @@ An Nginx reverse proxy is provided at `infra/nginx/nginx.conf` and is included i
 
 ### Media upload rate limit
 
-| Endpoint | Method | Limit | Burst | Response on violation |
-| --- | --- | --- | --- | --- |
-| `/api/posts` | `POST` | 10 requests / minute / IP | 2 | `429 Too Many Requests` |
-| `/api/posts/*/media` | `POST` | 10 requests / minute / IP | 2 | `429 Too Many Requests` |
+| Endpoint             | Method | Limit                     | Burst | Response on violation   |
+| -------------------- | ------ | ------------------------- | ----- | ----------------------- |
+| `/api/posts`         | `POST` | 10 requests / minute / IP | 2     | `429 Too Many Requests` |
+| `/api/posts/*/media` | `POST` | 10 requests / minute / IP | 2     | `429 Too Many Requests` |
 
 When the limit is exceeded Nginx returns:
 
@@ -761,11 +849,11 @@ The `burst=2 nodelay` parameters allow a burst of two requests above the limit t
 
 The Nginx service is included in the root `docker-compose.yml` and starts after all three backend services are healthy. It listens on port **80** and proxies:
 
-| Path prefix | Upstream |
-| --- | --- |
-| `/api/`, `/ws`, `/health`, `/metrics` | `indexer:3000` |
-| `/relay/` | `dm-relay:3001` |
-| `/oracle/` | `analytics-oracle:4000` |
+| Path prefix                           | Upstream                |
+| ------------------------------------- | ----------------------- |
+| `/api/`, `/ws`, `/health`, `/metrics` | `indexer:3000`          |
+| `/relay/`                             | `dm-relay:3001`         |
+| `/oracle/`                            | `analytics-oracle:4000` |
 
 ### Staging and production
 
@@ -987,24 +1075,24 @@ docker build \
 
 ### 10.3 Environment variables
 
-| Variable                  | Required | Default       | Description                                                                                                     |
-| ------------------------- | -------- | ------------- | --------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`            | ✅       | —             | PostgreSQL connection string for storing device tokens and delivery receipts                                    |
-| `PORT`                    |          | `3002`        | HTTP server port                                                                                                 |
-| `NODE_ENV`                |          | `development` | Runtime environment. Set to `production` in deployed environments                                               |
-| `REDIS_URL`               | ✅¹      | —             | Redis endpoint for shared rate limiting and fanout pub/sub. **Startup fails in production when unset**          |
-| `ALLOW_IN_MEMORY_RATE_LIMIT` |       | `false`       | Opt out of the `REDIS_URL` requirement for a deliberately single-replica deployment                             |
-| `INDEXER_WS_URL`          | ✅       | —             | WebSocket URL of the indexer service used to subscribe to on-chain events, e.g. `ws://indexer:3000/ws`          |
-| `DM_RELAY_WS_URL`         |          | —             | WebSocket URL of the dm-relay service for DM delivery events, e.g. `ws://dm-relay:3001/ws`                     |
-| `VAPID_PUBLIC_KEY`        | ✅       | —             | Web-push VAPID public key (base64url). Generate with: `npx web-push generate-vapid-keys`                       |
-| `VAPID_PRIVATE_KEY`       | ✅       | —             | Web-push VAPID private key. **Store in a secrets manager; never commit to source control**                      |
-| `VAPID_SUBJECT`           | ✅       | —             | VAPID subject: a mailto or https URL identifying the sender, e.g. `mailto:ops@linkora.io`                       |
-| `FCM_SERVER_KEY`          |          | —             | Firebase Cloud Messaging server key for Android push. **Store in a secrets manager**                            |
-| `APNS_KEY_ID`             |          | —             | Apple Push Notification service key ID for iOS push                                                             |
-| `APNS_TEAM_ID`            |          | —             | Apple developer team ID for APNs                                                                                |
-| `APNS_PRIVATE_KEY`        |          | —             | APNs private key (PEM). **Store in a secrets manager; never commit to source control**                          |
-| `CORS_ORIGIN`             |          | `http://localhost:3000` | Comma-separated allowed CORS origins for the subscription API                                         |
-| `LOG_LEVEL`               |          | `info`        | Minimum log level: `trace` \| `debug` \| `info` \| `warn` \| `error` \| `fatal`                                |
+| Variable                     | Required | Default                 | Description                                                                                            |
+| ---------------------------- | -------- | ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| `DATABASE_URL`               | ✅       | —                       | PostgreSQL connection string for storing device tokens and delivery receipts                           |
+| `PORT`                       |          | `3002`                  | HTTP server port                                                                                       |
+| `NODE_ENV`                   |          | `development`           | Runtime environment. Set to `production` in deployed environments                                      |
+| `REDIS_URL`                  | ✅¹      | —                       | Redis endpoint for shared rate limiting and fanout pub/sub. **Startup fails in production when unset** |
+| `ALLOW_IN_MEMORY_RATE_LIMIT` |          | `false`                 | Opt out of the `REDIS_URL` requirement for a deliberately single-replica deployment                    |
+| `INDEXER_WS_URL`             | ✅       | —                       | WebSocket URL of the indexer service used to subscribe to on-chain events, e.g. `ws://indexer:3000/ws` |
+| `DM_RELAY_WS_URL`            |          | —                       | WebSocket URL of the dm-relay service for DM delivery events, e.g. `ws://dm-relay:3001/ws`             |
+| `VAPID_PUBLIC_KEY`           | ✅       | —                       | Web-push VAPID public key (base64url). Generate with: `npx web-push generate-vapid-keys`               |
+| `VAPID_PRIVATE_KEY`          | ✅       | —                       | Web-push VAPID private key. **Store in a secrets manager; never commit to source control**             |
+| `VAPID_SUBJECT`              | ✅       | —                       | VAPID subject: a mailto or https URL identifying the sender, e.g. `mailto:ops@linkora.io`              |
+| `FCM_SERVER_KEY`             |          | —                       | Firebase Cloud Messaging server key for Android push. **Store in a secrets manager**                   |
+| `APNS_KEY_ID`                |          | —                       | Apple Push Notification service key ID for iOS push                                                    |
+| `APNS_TEAM_ID`               |          | —                       | Apple developer team ID for APNs                                                                       |
+| `APNS_PRIVATE_KEY`           |          | —                       | APNs private key (PEM). **Store in a secrets manager; never commit to source control**                 |
+| `CORS_ORIGIN`                |          | `http://localhost:3000` | Comma-separated allowed CORS origins for the subscription API                                          |
+| `LOG_LEVEL`                  |          | `info`                  | Minimum log level: `trace` \| `debug` \| `info` \| `warn` \| `error` \| `fatal`                        |
 
 ¹ `REDIS_URL` is required whenever `NODE_ENV=production` — see [§2.4](#24-shared-rate-limiting-redis_url).
 
@@ -1101,22 +1189,22 @@ docker build \
 
 ### 11.3 Environment variables
 
-| Variable                 | Required | Default       | Description                                                                                                   |
-| ------------------------ | -------- | ------------- | ------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`           | ✅       | —             | PostgreSQL connection string for the search index tables                                                      |
-| `PORT`                   |          | `3003`        | HTTP server port                                                                                               |
-| `NODE_ENV`               |          | `development` | Runtime environment. Set to `production` in deployed environments                                             |
-| `REDIS_URL`              | ✅¹      | —             | Redis endpoint for shared rate limiting. **Startup fails in production when unset**                           |
-| `ALLOW_IN_MEMORY_RATE_LIMIT` |      | `false`       | Opt out of the `REDIS_URL` requirement for a deliberately single-replica deployment                           |
-| `INDEXER_URL`            | ✅       | —             | Base URL of the indexer REST API used to consume post/profile data, e.g. `http://indexer:3000`               |
-| `INDEXER_WS_URL`         | ✅       | —             | WebSocket URL of the indexer for real-time index updates, e.g. `ws://indexer:3000/ws`                        |
-| `SEARCH_ENGINE`          |          | `pg_trgm`     | Search backend: `pg_trgm` (PostgreSQL trigram, zero extra infra) or `opensearch` (managed OpenSearch cluster) |
-| `OPENSEARCH_URL`         |          | —             | OpenSearch/Elasticsearch endpoint. Required when `SEARCH_ENGINE=opensearch`                                   |
-| `OPENSEARCH_API_KEY`     |          | —             | OpenSearch API key. **Store in a secrets manager; never commit to source control**                            |
-| `MAX_RESULTS_PER_QUERY`  |          | `50`          | Upper bound on results returned per search query to limit DB load                                             |
-| `SEARCH_RATE_LIMIT_RPM`  |          | `60`          | Maximum search requests per minute per IP                                                                     |
-| `CORS_ORIGIN`            |          | `http://localhost:3000` | Comma-separated allowed CORS origins for the search API                                            |
-| `LOG_LEVEL`              |          | `info`        | Minimum log level: `trace` \| `debug` \| `info` \| `warn` \| `error` \| `fatal`                              |
+| Variable                     | Required | Default                 | Description                                                                                                   |
+| ---------------------------- | -------- | ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`               | ✅       | —                       | PostgreSQL connection string for the search index tables                                                      |
+| `PORT`                       |          | `3003`                  | HTTP server port                                                                                              |
+| `NODE_ENV`                   |          | `development`           | Runtime environment. Set to `production` in deployed environments                                             |
+| `REDIS_URL`                  | ✅¹      | —                       | Redis endpoint for shared rate limiting. **Startup fails in production when unset**                           |
+| `ALLOW_IN_MEMORY_RATE_LIMIT` |          | `false`                 | Opt out of the `REDIS_URL` requirement for a deliberately single-replica deployment                           |
+| `INDEXER_URL`                | ✅       | —                       | Base URL of the indexer REST API used to consume post/profile data, e.g. `http://indexer:3000`                |
+| `INDEXER_WS_URL`             | ✅       | —                       | WebSocket URL of the indexer for real-time index updates, e.g. `ws://indexer:3000/ws`                         |
+| `SEARCH_ENGINE`              |          | `pg_trgm`               | Search backend: `pg_trgm` (PostgreSQL trigram, zero extra infra) or `opensearch` (managed OpenSearch cluster) |
+| `OPENSEARCH_URL`             |          | —                       | OpenSearch/Elasticsearch endpoint. Required when `SEARCH_ENGINE=opensearch`                                   |
+| `OPENSEARCH_API_KEY`         |          | —                       | OpenSearch API key. **Store in a secrets manager; never commit to source control**                            |
+| `MAX_RESULTS_PER_QUERY`      |          | `50`                    | Upper bound on results returned per search query to limit DB load                                             |
+| `SEARCH_RATE_LIMIT_RPM`      |          | `60`                    | Maximum search requests per minute per IP                                                                     |
+| `CORS_ORIGIN`                |          | `http://localhost:3000` | Comma-separated allowed CORS origins for the search API                                                       |
+| `LOG_LEVEL`                  |          | `info`                  | Minimum log level: `trace` \| `debug` \| `info` \| `warn` \| `error` \| `fatal`                               |
 
 ¹ `REDIS_URL` is required whenever `NODE_ENV=production` — see [§2.4](#24-shared-rate-limiting-redis_url).
 
@@ -1171,7 +1259,7 @@ search:
     interval: 15s
     timeout: 5s
     retries: 3
-    start_period: 60s  # Allow time for the initial index build
+    start_period: 60s # Allow time for the initial index build
 ```
 
 ### 11.6 Scaling notes
@@ -1186,4 +1274,3 @@ search:
   PostgreSQL database from expensive full-text scans under high traffic.
 - `REDIS_URL` is mandatory in production and must point at the same endpoint as
   all other services to share the rate-limit store.
-
